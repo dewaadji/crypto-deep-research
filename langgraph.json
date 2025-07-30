@@ -1,0 +1,9 @@
+{
+    "dockerfile_lines": [],
+    "graphs": {
+      "Crypto Person": "./src/orchestrator_agent.py:crypt"
+    },
+    "python_version": "3.11",
+    "env": ".env",
+    "dependencies": ["."]
+}
