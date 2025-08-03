@@ -6,7 +6,6 @@ import asyncio
 from typing import Literal
 
 from src.state import (
-    # AgentState,
     ClarifyWithUser,
     InputState,
     DelegateAgent,
@@ -20,6 +19,8 @@ from src.utils import (
     allow_clarification,
     load_heurist_mcp,
     load_flipside_mcp,
+    retry_mcp_tool_call,
+    get_current_date_time,
 )
 from src.prompt import (
     clarify_with_user_instructions,
@@ -29,13 +30,15 @@ from src.prompt import (
     summary_system_prompt
 )
 
+current_datetime = get_current_date_time()
+
 async def clarify_with_user(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor", "__end__"]]:
     if not allow_clarification:
         return Command(
             goto="supervisor", 
             update={"supervisor_messages": {"type": "override",
                     "value": [
-                        SystemMessage(content=supervisor_system_prompt),
+                        SystemMessage(content=supervisor_system_prompt.format(current_datetime=current_datetime)),
                         HumanMessage(content=response.verification)
                     ]
                 }})
@@ -48,7 +51,7 @@ async def clarify_with_user(state: SupervisorState, config: RunnableConfig) -> C
     #     HumanMessage(content=clarify_with_user_instructions.format(messages=get_buffer_string(messages))),
     #     SystemMessage(content=supervisor_system_prompt)
     #     ])
-    response = await clarify_model.ainvoke([HumanMessage(content=clarify_with_user_instructions.format(messages=get_buffer_string(messages)))])
+    response = await clarify_model.ainvoke([HumanMessage(content=clarify_with_user_instructions.format(messages=get_buffer_string(messages), current_datetime=current_datetime))])
     
     print(f"\nresponse clarify_user: \n{response}")
     if response.need_clarification:
@@ -63,7 +66,7 @@ async def clarify_with_user(state: SupervisorState, config: RunnableConfig) -> C
                 "supervisor_messages": {
                     "type": "override",
                     "value": [
-                        SystemMessage(content=supervisor_system_prompt),
+                        SystemMessage(content=supervisor_system_prompt.format(current_datetime=current_datetime)),
                         HumanMessage(content=response.verification)
                     ]
                 }
@@ -157,18 +160,26 @@ async def heurist_agent(state: HeuristAgentState, config: RunnableConfig) -> Com
             for call in tool_calls:
                 tool = next((t for t in tools if t.name==call['name']), None)
                 if tool:
-                    tasks.append(tool.ainvoke(call["args"]))
+                    tasks.append(retry_mcp_tool_call(tool, call["args"]))
         
-            results = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            tool_messages = [
-                ToolMessage(
-                    name=call["name"],
-                    tool_call_id=call["id"],
-                    content=result
-                )
-                for call, result in zip(tool_calls, results)
-            ]
+            tool_messages = []
+            for call, result in zip(tool_calls, results):
+                if isinstance(result, Exception):
+                    # If the tool call failed after retries, create an error message
+                    error_content = f"Tool call failed after retries: {str(result)}"
+                    tool_messages.append(ToolMessage(
+                        name=call["name"],
+                        tool_call_id=call["id"],
+                        content=error_content
+                    ))
+                else:
+                    tool_messages.append(ToolMessage(
+                        name=call["name"],
+                        tool_call_id=call["id"],
+                        content=result
+                    ))
             messages.append(response)
             messages.extend(tool_messages)
         else:
@@ -213,18 +224,26 @@ async def flipside_agent(state: FlipsideAgentState, config: RunnableConfig) -> C
             for call in tool_calls:
                 tool = next((t for t in tools if t.name==call['name']), None)
                 if tool:
-                    tasks.append(tool.ainvoke(call["args"]))
+                    tasks.append(retry_mcp_tool_call(tool, call["args"]))
         
-            results = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            tool_messages = [
-                ToolMessage(
-                    name=call["name"],
-                    tool_call_id=call["id"],
-                    content=result
-                )
-                for call, result in zip(tool_calls, results)
-            ]
+            tool_messages = []
+            for call, result in zip(tool_calls, results):
+                if isinstance(result, Exception):
+                    # If the tool call failed after retries, create an error message
+                    error_content = f"Tool call failed after retries: {str(result)}"
+                    tool_messages.append(ToolMessage(
+                        name=call["name"],
+                        tool_call_id=call["id"],
+                        content=error_content
+                    ))
+                else:
+                    tool_messages.append(ToolMessage(
+                        name=call["name"],
+                        tool_call_id=call["id"],
+                        content=result
+                    ))
             messages.append(response)
             messages.extend(tool_messages)
         else:
@@ -244,8 +263,8 @@ flipside_subgraph = flipside_builder.compile()
 
 supervisor_builder = StateGraph(SupervisorState)
 supervisor_builder.add_node("supervisor", supervisor)
-supervisor_builder.add_node("heurist_agent", heurist_subgraph)
-supervisor_builder.add_node("flipside_agent", flipside_subgraph)
+supervisor_builder.add_node("heurist_agent", heurist_agent)
+supervisor_builder.add_node("flipside_agent", flipside_agent)
 supervisor_builder.add_edge(START, "supervisor")
 supervisor_builder.add_edge("supervisor", END)
 supervisor_subgraph = supervisor_builder.compile()
