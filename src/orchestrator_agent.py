@@ -12,21 +12,25 @@ from src.state import (
     SupervisorState,
     HeuristAgentState,
     FlipsideAgentState,
+    TavilyAgentState,
 )
 from src.utils import (
     configurable_model,
+    summary_model,
     max_structured_output_retries,
     allow_clarification,
     load_heurist_mcp,
     load_flipside_mcp,
     retry_mcp_tool_call,
     get_current_date_time,
+    load_tavily_search,
 )
 from src.prompt import (
     clarify_with_user_instructions,
     supervisor_system_prompt,
     heurist_mcp_system_prompt,
     flipside_mcp_system_prompt,
+    tavily_mcp_system_prompt,
     summary_system_prompt
 )
 
@@ -74,7 +78,7 @@ async def clarify_with_user(state: SupervisorState, config: RunnableConfig) -> C
         )
 
 
-async def supervisor(state:SupervisorState, config: RunnableConfig) -> Command[Literal["heurist_agent", "flipside_agent", "__end__"]]:
+async def supervisor(state:SupervisorState, config: RunnableConfig) -> Command[Literal["heurist_agent", "flipside_agent", "tavily_agent", "__end__"]]:
     # human_message = state.get("supervisor_messages", [])
     supervisor_message = state.get("supervisor_messages", [])
     if isinstance(supervisor_message, str):
@@ -89,10 +93,10 @@ async def supervisor(state:SupervisorState, config: RunnableConfig) -> Command[L
     # ]
 
     response = await supervisor_model.ainvoke(supervisor_message)
-    print(f"\nresponse task supervisor: \n{response.heurist_queries} \n{response.flipside_queries}")
+    print(f"\nresponse task supervisor: \n{response.heurist_queries} \n{response.flipside_queries} \n{response.tavily_queries}")
     
     #skip if all None
-    if not response.heurist_queries and not response.flipside_queries:
+    if not response.heurist_queries and not response.flipside_queries and not response.tavily_queries:
         return Command(goto="__end__")
 
     # print(response)
@@ -100,7 +104,7 @@ async def supervisor(state:SupervisorState, config: RunnableConfig) -> Command[L
     if response.heurist_queries:
         heurist_call = heurist_subgraph.ainvoke({
             "heurist_queries": [
-                SystemMessage(content=heurist_mcp_system_prompt),
+                SystemMessage(content=heurist_mcp_system_prompt.format(current_datetime=current_datetime)),
                 HumanMessage(content=response.heurist_queries)
             ],
         }, config)
@@ -108,21 +112,32 @@ async def supervisor(state:SupervisorState, config: RunnableConfig) -> Command[L
     if response.flipside_queries:
         flipside_call = flipside_subgraph.ainvoke({
             "flipside_queries": [
-                SystemMessage(content=flipside_mcp_system_prompt),
+                SystemMessage(content=flipside_mcp_system_prompt.format(current_datetime=current_datetime)),
                 HumanMessage(content=response.flipside_queries)
             ]
         }, config)
         coros.append(flipside_call)
+    if response.tavily_queries:
+        tavily_call = tavily_subgraph.ainvoke({
+            "tavily_queries": [
+                SystemMessage(content=tavily_mcp_system_prompt.format(current_datetime=current_datetime)),
+                HumanMessage(content=response.tavily_queries)
+            ]
+        }, config)
+        coros.append(tavily_call)
 
     results = await asyncio.gather(*coros)
     #baru
     heurist_results = []
     flipside_results = []
+    tavily_results = []
     for result in results:
         if "heurist_results" in result:
             heurist_results.append(result["heurist_results"])
         if "flipside_results" in result:
             flipside_results.append(result["flipside_results"])
+        if "tavily_results" in result:
+            tavily_results.append(result["tavily_results"])
 
     return Command(
         goto="__end__",
@@ -130,7 +145,9 @@ async def supervisor(state:SupervisorState, config: RunnableConfig) -> Command[L
             "heurist_queries": response.heurist_queries,
             "heurist_results": heurist_results,
             "flipside_queries": response.flipside_queries,
-            "flipside_results": flipside_results
+            "flipside_results": flipside_results,
+            "tavily_queries": response.tavily_queries,
+            "tavily_results": tavily_results
         }
     )
 
@@ -261,10 +278,74 @@ flipside_builder.add_node("flipside_agent", flipside_agent)
 flipside_builder.set_entry_point("flipside_agent")
 flipside_subgraph = flipside_builder.compile()
 
+async def tavily_agent(state: TavilyAgentState, config: RunnableConfig) -> Command[Literal["__end__"]]:
+    query = state.get("tavily_queries", [])
+    messages = query if isinstance(query, list) else [HumanMessage(content=query)]
+    
+    # Load Tavily search tool
+    tools = await load_tavily_search(config)
+    if not query:
+        return Command(
+            goto="__end__", 
+            update={
+                "tavily_queries": [HumanMessage(content="No messages provided")],
+                "tavily_results": ["No messages provided"]
+                }
+            )
+    
+    tavily_model = configurable_model.bind_tools(tools)
+    while True:
+        response = await tavily_model.ainvoke(messages, config)
+        
+        if response.tool_calls:
+            tool_calls = response.tool_calls
+            tasks = []
+            for call in tool_calls:
+                tool = next((t for t in tools if t.name==call['name']), None)
+                if tool:
+                    tasks.append(tool.ainvoke(call["args"]))
+        
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            tool_messages = []
+            for call, result in zip(tool_calls, results):
+                if isinstance(result, Exception):
+                    # If the tool call failed, create an error message
+                    error_content = f"Search failed: {str(result)}"
+                    tool_messages.append(ToolMessage(
+                        name=call["name"],
+                        tool_call_id=call["id"],
+                        content=error_content
+                    ))
+                else:
+                    tool_messages.append(ToolMessage(
+                        name=call["name"],
+                        tool_call_id=call["id"],
+                        content=result
+                    ))
+            messages.append(response)
+            messages.extend(tool_messages)
+        else:
+            break
+    
+    return Command(
+        goto="__end__",
+        update={
+            "tavily_queries": query,
+            "tavily_results": response.content
+        }
+    )
+
+tavily_builder = StateGraph(TavilyAgentState)
+tavily_builder.add_node("tavily_agent", tavily_agent)
+tavily_builder.set_entry_point("tavily_agent")
+tavily_subgraph = tavily_builder.compile()
+
 supervisor_builder = StateGraph(SupervisorState)
 supervisor_builder.add_node("supervisor", supervisor)
 supervisor_builder.add_node("heurist_agent", heurist_agent)
 supervisor_builder.add_node("flipside_agent", flipside_agent)
+supervisor_builder.add_node("tavily_agent", tavily_agent)
 supervisor_builder.add_edge(START, "supervisor")
 supervisor_builder.add_edge("supervisor", END)
 supervisor_subgraph = supervisor_builder.compile()
@@ -272,11 +353,18 @@ supervisor_subgraph = supervisor_builder.compile()
 async def summary_agent(state: SupervisorState, config: RunnableConfig): #SupervisorState for switch without clarify_with_user
     heurist_state = state.get("heurist_results", [])
     flipside_state = state.get("flipside_results", [])
-    cleared_state = {"heurist_results": {"type": "override", "value": []}, "flipside_results": {"type": "override", "value": []}}
+    tavily_state = state.get("tavily_results", [])
+    cleared_state = {
+        "heurist_results": {"type": "override", "value": []}, 
+        "flipside_results": {"type": "override", "value": []},
+        "tavily_results": {"type": "override", "value": []}
+    }
     
     heurist_results = heurist_state if isinstance(heurist_state, list) else [HumanMessage(content=heurist_state)]
     flipside_results = flipside_state if isinstance(flipside_state, list) else [HumanMessage(content=flipside_state)]
-    if not heurist_results and not flipside_results:
+    tavily_results = tavily_state if isinstance(tavily_state, list) else [HumanMessage(content=tavily_state)]
+    
+    if not heurist_results and not flipside_results and not tavily_results:
         return Command(
             goto=END, 
             update={
@@ -287,10 +375,11 @@ async def summary_agent(state: SupervisorState, config: RunnableConfig): #Superv
 
     summary_prompt = summary_system_prompt.format(
         heurist_results=heurist_results,
-        flipside_results=flipside_results
+        flipside_results=flipside_results,
+        tavily_results=tavily_results
     )
     try:
-        summary = await configurable_model.ainvoke([HumanMessage(content=summary_prompt)])
+        summary = await summary_model.ainvoke([HumanMessage(content=summary_prompt)])
         return {
             "final_answer": summary.content,
             "messages": [summary],

@@ -8,17 +8,18 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "langchain_core==0.3.68",
+    "langchain_core==0.3.72",
     "langchain_openai==0.3.27",
     "langchain_tavily==0.2.6",
-    "langgraph==0.5.0",
+    "langgraph==0.6.2",
     "langsmith==0.4.4",
     "pydantic==2.11.7",
     "python-dotenv==1.0.1",
     "requests==2.32.4",
     "sseclient==0.0.27",
     "sseclient_py==1.8.0",
-    "sympy==1.14.0"
+    "sympy==1.14.0",
+    "tavily-python>=0.5.0"
 ]
 
 [project.optional-dependencies]

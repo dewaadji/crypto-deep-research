@@ -16,6 +16,9 @@ class DelegateAgent(BaseModel):
     flipside_queries: str = Field(
         description="The input for db call, must be described in high detail following SQL rule query."
     )
+    tavily_queries: str = Field(
+        description="The input for web search, must be described in high detail for comprehensive web research."
+    )
 
 class ClarifyWithUser(BaseModel):
     need_clarification: bool = Field(
@@ -45,6 +48,8 @@ class SupervisorState(MessagesState):
     heurist_results: Optional[str]
     flipside_queries: Optional[str]       
     flipside_results: Optional[str]
+    tavily_queries: Optional[str]
+    tavily_results: Optional[str]
     # Meta
     final_answer: Annotated[Optional[str], override_reducer]
 
@@ -55,3 +60,7 @@ class HeuristAgentState(TypedDict):
 class FlipsideAgentState(TypedDict):
     flipside_queries: Optional[str]
     flipside_results: Optional[str]
+
+class TavilyAgentState(TypedDict):
+    tavily_queries: Optional[str]
+    tavily_results: Optional[str]

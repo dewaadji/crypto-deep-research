@@ -1,11 +1,12 @@
 import os
 import asyncio
-from typing import List
+from typing import List, Literal, Annotated
 from datetime import datetime
 from langchain.chat_models import init_chat_model
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, tool, InjectedToolArg
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from tavily import AsyncTavilyClient
 import traceback
 from dotenv import load_dotenv
 
@@ -18,8 +19,121 @@ configurable_model = init_chat_model(
     base_url= os.getenv("HEURIST_BASE_URL"),
     temperature=0
 )
+
+# Summary agent model with higher temperature for more creative output
+summary_model = init_chat_model(
+    model= "deepseek/deepseek-r1-distill-llama-70b",
+    model_provider= "openai",
+    api_key= os.getenv("HEURIST_API_KEY"),
+    base_url= os.getenv("HEURIST_BASE_URL"),
+    temperature=0.5
+)
+
 max_structured_output_retries = 3
 allow_clarification = True
+
+##########################
+# Tavily Search Tool Utils
+##########################
+TAVILY_SEARCH_DESCRIPTION = (
+    "A search engine optimized for comprehensive, accurate, and trusted results. "
+    "Useful for when you need to answer questions about current events."
+)
+
+@tool(description=TAVILY_SEARCH_DESCRIPTION)
+async def tavily_search(
+    queries: List[str],
+    max_results: Annotated[int, InjectedToolArg] = 5,
+    topic: Annotated[Literal["general", "news", "finance"], InjectedToolArg] = "general",
+    config: RunnableConfig = None
+) -> str:
+    """
+    Fetches results from Tavily search API.
+
+    Args:
+        queries (List[str]): List of search queries, you can pass in as many queries as you need.
+        max_results (int): Maximum number of results to return
+        topic (Literal['general', 'news', 'finance']): Topic to filter results by
+
+    Returns:
+        str: A formatted string of search results
+    """
+    search_results = await tavily_search_async(
+        queries,
+        max_results=max_results,
+        topic=topic,
+        include_raw_content=True,
+        config=config
+    )
+    
+    # Format the search results and deduplicate results by URL
+    formatted_output = f"Search results: \n\n"
+    unique_results = {}
+    for response in search_results:
+        for result in response['results']:
+            url = result['url']
+            if url not in unique_results:
+                unique_results[url] = {**result, "query": response['query']}
+    
+    for i, (url, result) in enumerate(unique_results.items()):
+        formatted_output += f"\n\n--- SOURCE {i+1}: {result['title']} ---\n"
+        formatted_output += f"URL: {url}\n\n"
+        formatted_output += f"CONTENT:\n{result['content']}\n\n"
+        if result.get('raw_content'):
+            formatted_output += f"RAW CONTENT:\n{result['raw_content'][:1000]}...\n\n"
+        formatted_output += "\n\n" + "-" * 80 + "\n"
+    
+    if unique_results:
+        return formatted_output
+    else:
+        return "No valid search results found. Please try different search queries or use a different search API."
+
+async def tavily_search_async(search_queries, max_results: int = 5, topic: Literal["general", "news", "finance"] = "general", include_raw_content: bool = True, config: RunnableConfig = None):
+    """
+    Performs concurrent web searches with the Tavily API
+    
+    Args:
+        search_queries: List of search queries to execute
+        max_results: Maximum number of results per query
+        topic: Topic filter for search results
+        include_raw_content: Whether to include raw content in results
+        config: RunnableConfig for API key access
+    
+    Returns:
+        List[dict]: List of search responses from Tavily API
+    """
+    tavily_async_client = AsyncTavilyClient(api_key=get_tavily_api_key(config))
+    search_tasks = []
+    for query in search_queries:
+        search_tasks.append(
+            tavily_async_client.search(
+                query,
+                max_results=max_results,
+                include_raw_content=include_raw_content,
+                topic=topic
+            )
+        )
+    search_docs = await asyncio.gather(*search_tasks)
+    return search_docs
+
+def get_tavily_api_key(config: RunnableConfig):
+    """
+    Get Tavily API key from config or environment variables
+    
+    Args:
+        config: RunnableConfig containing API keys
+    
+    Returns:
+        str: Tavily API key
+    """
+    should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
+    if should_get_from_config.lower() == "true":
+        api_keys = config.get("configurable", {}).get("apiKeys", {})
+        if not api_keys:
+            return None
+        return api_keys.get("TAVILY_API_KEY")
+    else:
+        return os.getenv("TAVILY_API_KEY")
 
 def get_current_date_time():
     """
@@ -109,7 +223,7 @@ async def load_heurist_mcp(config: RunnableConfig) -> List[BaseTool]:
     return mcp_tools
 #tools flipside
 async def load_flipside_mcp(config: RunnableConfig) -> List[BaseTool]:
-    mcp_sse_url = os.getenv("FLIPSIDE_MCP_URL")
+    mcp_sse_url = os.getenv("FLIPSIDE_MCP_URLV2")
     mcp_server_config = {
         "flipside_mcp": {
             "transport": "sse",
@@ -125,3 +239,28 @@ async def load_flipside_mcp(config: RunnableConfig) -> List[BaseTool]:
         traceback.print_exception(type(e), e, e.__traceback__)
         return []
     return mcp_tools
+
+# Tavily search tool
+async def load_tavily_search(config: RunnableConfig) -> List[BaseTool]:
+    """
+    Load Tavily search tool
+    
+    Args:
+        config: RunnableConfig for API key access
+    
+    Returns:
+        List[BaseTool]: List containing the Tavily search tool
+    """
+    try:
+        # Check if Tavily API key is available
+        api_key = get_tavily_api_key(config)
+        if not api_key:
+            print("Warning: TAVILY_API_KEY not found in environment variables or config")
+            return []
+        
+        # Return the tavily_search tool
+        return [tavily_search]
+    except Exception as e:
+        print(f"Error loading Tavily search tool: {e}")
+        traceback.print_exception(type(e), e, e.__traceback__)
+        return []
