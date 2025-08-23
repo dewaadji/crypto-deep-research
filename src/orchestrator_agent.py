@@ -50,11 +50,6 @@ async def clarify_with_user(state: SupervisorState, config: RunnableConfig) -> C
     messages = state["messages"]
     
     clarify_model = configurable_model.with_structured_output(ClarifyWithUser).with_retry(stop_after_attempt=max_structured_output_retries)
-    
-    # response = await clarify_model.ainvoke([
-    #     HumanMessage(content=clarify_with_user_instructions.format(messages=get_buffer_string(messages))),
-    #     SystemMessage(content=supervisor_system_prompt)
-    #     ])
     response = await clarify_model.ainvoke([HumanMessage(content=clarify_with_user_instructions.format(messages=get_buffer_string(messages), current_datetime=current_datetime))])
     
     print(f"\nresponse clarify_user: \n{response}")
@@ -66,7 +61,6 @@ async def clarify_with_user(state: SupervisorState, config: RunnableConfig) -> C
         return Command(
             goto="supervisor", 
             update={
-                # "supervisor_messages": [AIMessage(content=response.verification)],
                 "supervisor_messages": {
                     "type": "override",
                     "value": [
@@ -79,18 +73,12 @@ async def clarify_with_user(state: SupervisorState, config: RunnableConfig) -> C
 
 
 async def supervisor(state:SupervisorState, config: RunnableConfig) -> Command[Literal["heurist_agent", "flipside_agent", "tavily_agent", "__end__"]]:
-    # human_message = state.get("supervisor_messages", [])
     supervisor_message = state.get("supervisor_messages", [])
     if isinstance(supervisor_message, str):
         supervisor_message = [HumanMessage(content=supervisor_message)]
     print(f"\ninput received supervisor: \n{supervisor_message}")
     
     supervisor_model = configurable_model.with_structured_output(DelegateAgent)
-
-    # messages = [
-    #     SystemMessage(content=supervisor_system_prompt),
-    #     *supervisor_message
-    # ]
 
     response = await supervisor_model.ainvoke(supervisor_message)
     print(f"\nresponse task supervisor: \n{response.heurist_queries} \n{response.flipside_queries} \n{response.tavily_queries}")
@@ -127,7 +115,7 @@ async def supervisor(state:SupervisorState, config: RunnableConfig) -> Command[L
         coros.append(tavily_call)
 
     results = await asyncio.gather(*coros)
-    #baru
+    
     heurist_results = []
     flipside_results = []
     tavily_results = []
@@ -350,7 +338,7 @@ supervisor_builder.add_edge(START, "supervisor")
 supervisor_builder.add_edge("supervisor", END)
 supervisor_subgraph = supervisor_builder.compile()
 
-async def summary_agent(state: SupervisorState, config: RunnableConfig): #SupervisorState for switch without clarify_with_user
+async def summary_agent(state: SupervisorState, config: RunnableConfig): 
     heurist_state = state.get("heurist_results", [])
     flipside_state = state.get("flipside_results", [])
     tavily_state = state.get("tavily_results", [])
@@ -385,103 +373,19 @@ async def summary_agent(state: SupervisorState, config: RunnableConfig): #Superv
             "messages": [summary],
             **cleared_state
         }
-        # return Command(
-        #     goto=END,
-        #     update={"final_answer": [AIMessage(content=summary.content)]}
-        # )
     except Exception as e:
         return {
             "final_answer": "Error generating final report: Maximum retries exceeded",
             "messages": [AIMessage(content=f"Error generating final report: {e}")],
             **cleared_state
         }
-        # return Command(
-        #     goto=END,
-        #     update={"final_answer": [AIMessage(content=f"Error generating final report: {e}")]}
-        # )
 
-# Add conditional edge from clarify_with_user
-def should_continue_after_clarify(state):
-    # Check if we have supervisor_messages (meaning clarification was provided)
-    if state.get("supervisor_messages"):
-        return "supervisor"
-    # Otherwise, end the workflow (clarification needed)
-    return END
 
 ccp = StateGraph(SupervisorState, input_schema=InputState, config=RunnableConfig) 
 ccp.add_node("clarify_with_user", clarify_with_user)
 ccp.add_node("supervisor", supervisor_subgraph)
 ccp.add_node("summary_agent", summary_agent)
 ccp.add_edge(START, "clarify_with_user")
-# ccp.add_conditional_edges(
-#     "clarify_with_user",
-#     should_continue_after_clarify,
-#     {
-#         "supervisor": "supervisor",
-#         END: END
-#     }
-# )
 ccp.add_edge("supervisor", "summary_agent")
 ccp.add_edge("summary_agent", END)
 crypt = ccp.compile()
-
-
-# def print_streamed_event(event):
-#     kind = event.get("event")
-#     if kind == "on_chat_model_stream":
-#         content = event["data"]["chunk"].content
-#         if content:
-#             print(content, end="", flush=True)
-#     elif kind == "on_tool_start":
-#         print(f"\n[Tool Start] {event['name']} with inputs: {event['data'].get('input')}")
-#     elif kind == "on_tool_end":
-#         print(f"[Tool End] {event['name']} output: {event['data'].get('output')}")
-#     elif kind == "on_chain_end":
-#         print("\n[Chain End]")
-
-# async def main():
-#     print("Welcome to the Crypto-Orchestrator Agent! Type 'exit' or 'quit' to stop.")
-#     while True:
-#         user_input = input("User: ").strip()
-#         if user_input.lower() in {"exit", "quit"}:
-#             print("Exiting.")
-#             break
-        
-#         # Prepare initial state for the graph
-#         initial_state = {"messages": [HumanMessage(content=user_input)]}
-#         print("\n[Streaming response...]")
-        
-#         # Run the workflow and collect the result
-#         result = await crypt.ainvoke(initial_state)
-        
-#         # Check if we need clarification
-#         messages = result.get("messages", [])
-#         if messages and isinstance(messages[-1], AIMessage):
-#             ai_msg = messages[-1].content
-#             print(f"\nAI: {ai_msg}")
-            
-#             # Check if this is a clarification question
-#             if "clarify" in ai_msg.lower() or "please provide" in ai_msg.lower() or "need more information" in ai_msg.lower():
-#                 clarification_input = input("Your clarification: ").strip()
-#                 if clarification_input.lower() not in {"exit", "quit"}:
-#                     # Continue with clarification
-#                     clarification_state = {
-#                         "messages": [HumanMessage(content=clarification_input)],
-#                         "supervisor_messages": [HumanMessage(content=clarification_input)]
-#                     }
-#                     print("\n[Continuing with clarification...]")
-#                     async for event in crypt.astream_events(clarification_state, version="v1"):
-#                         print_streamed_event(event)
-#                     print("\n---\n")
-#                     continue
-#             else:
-#                 # Print the final result
-#                 print(f"\nFinal Answer: {result.get('final_answer', 'No final answer provided')}")
-#         else:
-#             # Print the final result
-#             print(f"\nFinal Answer: {result.get('final_answer', 'No final answer provided')}")
-        
-#         print("\n---\n")
-
-# if __name__ == "__main__":
-#     asyncio.run(main())
